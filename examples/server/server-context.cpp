@@ -17,6 +17,7 @@
 #include <iostream>
 #include <regex>
 #include <exception>
+#include <algorithm>
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min, llama_pos pos_max, int32_t offset) {
     ckpt.pos_min = pos_min;
@@ -253,9 +254,26 @@ bool server_context::load_model(const gpt_params& params_) {
             return false;
         }
 
+        // Multimodal support originally only covered a single MTP stage
+        // (see #1758: MTP's warmup was taught to consume mtmd embedding
+        // batches and re-derive its KV position from its own cache instead
+        // of counting text tokens). Composite stage chains (#1789) added
+        // token-only drafters (ngram-*, suffix) that never need embeddings
+        // at all - they just match against the flattened token stream
+        // (server_tokens::get_text_tokens_allow_mtmd(), where media chunk
+        // positions are LLAMA_TOKEN_NULL placeholders that simply never
+        // match a real n-gram). So the actual constraint is just "at most
+        // one stage may need the mtmd-embeddings warmup path" - any number
+        // of token-only stages can be chained alongside it.
+        auto stage_needs_target_embeddings = [](common_speculative_type type) {
+            return type == COMMON_SPECULATIVE_TYPE_MTP
+                || type == COMMON_SPECULATIVE_TYPE_DFLASH
+                || type == COMMON_SPECULATIVE_TYPE_EAGLE3;
+        };
         const auto spec_stages = params_base.speculative.get_resolved_stages();
-        const bool multimodal_spec_supported = spec_stages.empty() ||
-            (spec_stages.size() == 1 && spec_stages.front().type == COMMON_SPECULATIVE_TYPE_MTP);
+        const size_t n_embedding_stages = std::count_if(spec_stages.begin(), spec_stages.end(),
+            [&](const auto & stage) { return stage_needs_target_embeddings(stage.type); });
+        const bool multimodal_spec_supported = spec_stages.empty() || n_embedding_stages <= 1;
         if (!multimodal_spec_supported) {
             params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
             params_base.speculative.stages.clear();
@@ -3527,7 +3545,7 @@ void server_context::add_sampled_tokens() {
             static const llama_tokens empty_prompt;
             const llama_tokens & cached_text_tokens = slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                 ? empty_prompt
-                : slot.cache_tokens.get_text_tokens();
+                : (slot.cache_tokens.has_mtmd ? slot.cache_tokens.get_text_tokens_allow_mtmd() : slot.cache_tokens.get_text_tokens());
 
             auto & params_spec = slot.params.speculative;
             const llama_pos draft_base_pos = slot.uses_mtp() ? slot.cache_tokens.pos_next() : -1;
@@ -4773,7 +4791,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 static const llama_tokens empty_prompt;
                 const llama_tokens & spec_prompt = slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                     ? empty_prompt
-                    : slot.cache_tokens.get_text_tokens();
+                    : (slot.cache_tokens.has_mtmd ? slot.cache_tokens.get_text_tokens_allow_mtmd() : slot.cache_tokens.get_text_tokens());
                 common_speculative_begin(slot.spec, spec_prompt);
             }
 

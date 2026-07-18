@@ -437,6 +437,18 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const std::vector<llama_token>& get_text_tokens() const;
 
+    // like get_text_tokens(), but callable when has_mtmd is true. Returns the
+    // same flattened token vector, where media chunk positions are
+    // LLAMA_TOKEN_NULL placeholders (see the `tokens` member comment above).
+    // Only intended for consumers that are safe with those placeholders
+    // mixed in, such as a token-only speculative stage (e.g. ngram-mod)
+    // chained alongside MTP: LLAMA_TOKEN_NULL just never matches a real
+    // n-gram, so it acts as an inert boundary marker rather than corrupting
+    // anything. Do NOT use this for logic that assumes pure text (ctx
+    // shift, prompt truncation, slot save/load) - use get_text_tokens()
+    // (which asserts !has_mtmd) for those instead.
+    const std::vector<llama_token>& get_text_tokens_allow_mtmd() const;
+
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 

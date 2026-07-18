@@ -1365,6 +1365,12 @@ const std::vector<llama_token>& server_tokens::get_text_tokens() const {
     return tokens;
 }
 
+// like get_text_tokens(), but safe to call when has_mtmd is true - see the
+// declaration comment in server-common.h for the intended (narrow) use case.
+const std::vector<llama_token>& server_tokens::get_text_tokens_allow_mtmd() const {
+    return tokens;
+}
+
 // for compatibility with speculative decoding
 void server_tokens::set_token(llama_pos pos, llama_token id) {
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
