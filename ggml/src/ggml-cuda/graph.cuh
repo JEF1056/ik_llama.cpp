@@ -34,6 +34,15 @@ struct ggml_cuda_graph {
     bool disable_due_to_too_many_updates = false;
     bool disable_due_to_failed_graph_capture = false;
     int number_consecutive_updates = 0;
+    // Workloads with a stable graph shape most of the time but occasional
+    // bursts of shape changes (e.g. speculative decoding with a variable
+    // accepted-draft-length, such as MTP) would otherwise permanently trip
+    // disable_due_to_too_many_updates after only 4 consecutive updates and
+    // never attempt graph capture again for the rest of the run, even once
+    // the shape re-stabilizes. retry_cooldown counts calls remaining before
+    // we clear disable_due_to_too_many_updates and give capture another
+    // chance; see ggml_backend_cuda_graph_compute() in ggml-cuda.cu.
+    int retry_cooldown = 0;
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
     bool use_cpy_indirection = false;
     std::vector<char *> cpy_dest_ptrs;

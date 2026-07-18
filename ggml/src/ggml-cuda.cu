@@ -4727,6 +4727,23 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
         }
     }
 
+    // A workload that's mostly a stable shape but has occasional bursts of
+    // shape changes (e.g. speculative decoding with a variable accepted-
+    // draft-length, such as MTP's per-step verify batch) would otherwise trip
+    // disable_due_to_too_many_updates once and never attempt graph capture
+    // again for the rest of the run, even after the shape re-stabilizes.
+    // Periodically give it another chance instead of disabling permanently.
+    constexpr int GGML_CUDA_GRAPH_RETRY_INTERVAL = 64;
+    if (use_cuda_graph && graph->disable_due_to_too_many_updates && graph->retry_cooldown > 0) {
+        if (--graph->retry_cooldown == 0) {
+            graph->disable_due_to_too_many_updates = false;
+            graph->number_consecutive_updates = 0;
+#ifndef NDEBUG
+            GGML_CUDA_LOG_DEBUG("%s: retrying CUDA graph capture after cooldown\n", __func__);
+#endif
+        }
+    }
+
     if (use_cuda_graph && (
         graph->disable_due_to_gpu_arch ||
         graph->disable_due_to_too_many_updates ||
@@ -4750,6 +4767,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
         if (graph->number_consecutive_updates >= 4) {
             graph->disable_due_to_too_many_updates = true;
+            graph->retry_cooldown = GGML_CUDA_GRAPH_RETRY_INTERVAL;
             use_cuda_graph = false;
             cuda_ctx->cur_graph = nullptr;
 #ifndef NDEBUG
