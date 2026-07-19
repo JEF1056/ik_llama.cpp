@@ -2914,12 +2914,10 @@ void server_context::process_single_task(server_task&& task) {
 
             slots_data.push_back(slot_data);
         }
-        LOG_INFO("slot data", {
-            {"id_task",            task.id},
-            {"n_idle_slots",       n_idle_slots},
-            {"n_processing_slots", n_processing_slots}
-            });
-
+        // NOTE: this fires on every /health poll too (handle_health() issues a
+        // SERVER_TASK_TYPE_METRICS task that lands here), so a container health
+        // check running every few seconds would otherwise spam this at INFO
+        // level forever. Verbose-only; enable with --verbosity 1+ if needed.
         LOG_VERBOSE("slot data", {
             {"id_task",            task.id},
             {"n_idle_slots",       n_idle_slots},
@@ -3465,7 +3463,9 @@ bool server_context::slots_idle(){
         }
 
         if (all_idle) {
-            LOG_INFO("all slots are idle", {});
+            // Same rationale as the "slot data" log above: this is reached on every
+            // /health poll (via SERVER_TASK_TYPE_METRICS), so keep it verbose-only.
+            LOG_VERBOSE("all slots are idle", {});
             if (system_prompt.empty() && clean_kv_cache) {
                 kv_cache_clear();
             }

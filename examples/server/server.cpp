@@ -307,8 +307,10 @@ static json format_embeddings_response_oaicompat(const json& request, const json
 }
 
 static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
-    // skip GH copilot requests when using default port
-    if (req.path == "/v1/health" || req.path == "/v1/completions") {
+    // skip GH copilot requests when using default port, and skip /health
+    // (typically polled every few seconds by container/orchestrator health
+    // checks - logging every poll at INFO level is pure noise).
+    if (req.path == "/v1/health" || req.path == "/health" || req.path == "/v1/completions") {
         return;
     }
 
