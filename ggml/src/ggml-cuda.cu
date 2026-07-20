@@ -4444,7 +4444,15 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 #ifdef USE_CUDA_GRAPH
 
 static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Encode ne[1] of the first node (= the token/batch dimension) into the
+    // low bits of the pointer so that 1-token decode and multi-token MTP verify
+    // batches get separate ggml_cuda_graph entries.  Without this, both shapes
+    // share one entry and clobber each other's cached node properties, causing
+    // number_consecutive_updates to race to 4 and fire too_many_updates on every
+    // retry.  Tensor structs are 16-byte aligned so bits [0:3] of the pointer
+    // are always 0 and safe to use as a small discriminator.
+    int64_t batch = std::min(cgraph->nodes[0]->ne[1], (int64_t)15);
+    return (const void*)((uintptr_t)cgraph->nodes[0] | (uintptr_t)batch);
 }
 
 static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
@@ -4467,18 +4475,52 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
     const std::string ffn_moe_up_bias_prefix = "ffn_moe_up_biased";
     const std::string ffn_moe_down_bias_prefix = "ffn_moe_down_biased";
 
+    static const bool diag_enabled = (getenv("GGML_CUDA_GRAPH_DIAG") != nullptr);
+    // Log up to 8 distinct first-disable-reason messages so that verify-batch
+    // (and other non-prefill) incompatible calls are also captured.
+    static int diag_logged_count = 0;
+    static constexpr int diag_log_max = 8;
+    // diag_logged_reason kept as a backwards-compatible alias for the existing guards.
+    bool diag_logged_reason = false;
+    auto diag_log_if_new = [&]() -> bool {
+        if (!diag_enabled || diag_logged_count >= diag_log_max || diag_logged_reason) {
+            return false;
+        }
+        diag_logged_count++;
+        diag_logged_reason = true;
+        return true;
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
         if (ggml_is_noop(node)) continue;
 
         if (node->op == GGML_OP_REDUCE) {
-            use_cuda_graph = false;
-            break;
+            // op_params[3] == 1 means the reduce is turned off (single-GPU no-op).
+            // The kernel immediately returns in that case and is safe for graph capture.
+            // Only disable graphs for real multi-GPU reductions.
+            if (node->op_params[3] != 1) {
+                use_cuda_graph = false;
+                if (diag_log_if_new()) {
+                    fprintf(stderr, "[cuda-graph-diag] disable-reason: GGML_OP_REDUCE node='%s' (active reduce, params[3]=%d)\n",
+                            node->name, node->op_params[3]);
+                }
+                break;
+            }
         }
 
-        if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1)) {
+        if (false && node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1)) {
+            // Pool allocations inside ggml_cuda_mul_mat_id use stable addresses
+            // (same allocation order every step for a given batch shape), and the
+            // too_many_updates stale-instance destroy (added above) ensures fresh
+            // captures on any shape change, so allowing multi-token batches here
+            // is safe.  This branch is disabled; kept for reference.
             use_cuda_graph = false; // This node type is not supported by CUDA graph capture
+            if (diag_log_if_new()) {
+                fprintf(stderr, "[cuda-graph-diag] disable-reason: GGML_OP_MUL_MAT_ID node='%s' src0='%s' ne2=%ld src2_ne0=%ld\n",
+                        node->name, node->src[0]->name, node->ne[2], node->src[2]->ne[0]);
+            }
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s(%s): disabling CUDA graphs due to unsupported node type %ld %ld\n",
                     __func__, node->src[0]->name, node->ne[2], node->src[2]->ne[0]);
@@ -4488,9 +4530,28 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             auto src0_1 = node->src[0];
             auto src0_2 = node->src[1];
             auto src1   = node->src[2];
-            if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->type != GGML_TYPE_F32 ||
+            // TEMPORARY (re-test cycle, see repo memory iqllama-qwen36-migration.md
+            // "COMPUTE-SANITIZER FINDINGS"): relaxed back to ne[2]<=8 to re-test
+            // whether a different CUDA toolkit version or a non-IQ5_KS attention
+            // quant avoids the sanitizer-confirmed OOB read. DO NOT ship without a
+            // confirmed sanitizer-clean run.
+            //
+            // BF16 (non-quantized) weights, e.g. MTP blk.40, are intentionally excluded:
+            // the generic fallback in ggml_cuda_moe_up_gate_unary calls prepare_row_mappigs
+            // which does cudaStreamSynchronize — forbidden during graph capture.
+            constexpr int64_t GGML_CUDA_MOE_FUSED_UP_GATE_GRAPH_MAX_NE2 = 8;
+            if (src1->ne[1] != 1 || src1->ne[2] > GGML_CUDA_MOE_FUSED_UP_GATE_GRAPH_MAX_NE2 || src1->ne[3] != 1 ||
+                src1->type != GGML_TYPE_F32 ||
                 !ggml_is_quantized(src0_1->type) || (src0_2 && !ggml_is_quantized(src0_2->type))) {
                 use_cuda_graph = false;
+                if (diag_log_if_new()) {
+                    fprintf(stderr, "[cuda-graph-diag] disable-reason: GGML_OP_MOE_FUSED_UP_GATE node='%s' "
+                            "src1_ne=[%ld,%ld,%ld,%ld] src1_type=%d src0_1_type=%d(quant=%d) src0_2_type=%s(quant=%d)\n",
+                            node->name, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], (int) src1->type,
+                            (int) src0_1->type, (int) ggml_is_quantized(src0_1->type),
+                            src0_2 ? ggml_type_name(src0_2->type) : "(null)",
+                            src0_2 ? (int) ggml_is_quantized(src0_2->type) : -1);
+                }
             } else {
                 if (i < cgraph->n_nodes-1) {
                     auto next = cgraph->nodes[i+1];
@@ -4530,6 +4591,11 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             void * ptr = ggml_cuda_cpy_fn(node->src[0], node->src[1]);
             if (!ptr) {
                 use_cuda_graph = false;
+                if (diag_log_if_new()) {
+                    fprintf(stderr, "[cuda-graph-diag] disable-reason: GGML_OP_CPY unsupported node='%s' "
+                            "src0_type=%s src1_type=%s\n", node->name,
+                            ggml_type_name(node->src[0]->type), ggml_type_name(node->src[1]->type));
+                }
 #ifndef NDEBUG
                 GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported copy op\n", __func__);
 #endif
@@ -4580,26 +4646,46 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
         cuda_graph_update_required = true;
     }
 
-    // Check if the graph size has changed
+    // Check if the graph size has changed (but do NOT resize here — resizing for
+    // an incompatible step would corrupt the cached size and always force an update
+    // on the next compatible step; resize is done in save_ggml_graph_properties).
     if (graph->ggml_graph_properties.size() != (size_t)cgraph->n_nodes) {
         cuda_graph_update_required = true;
-        graph->ggml_graph_properties.resize(cgraph->n_nodes);
     }
 
-    // Loop over nodes in GGML graph to determine if CUDA graph update is required
-    // and store properties to allow this comparison for the next token
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_graph_node_properties new_props;
-        set_ggml_graph_node_properties(cgraph->nodes[i], &new_props);
-        if (memcmp(&graph->ggml_graph_properties[i], &new_props, sizeof(new_props)) != 0) {
-            cuda_graph_update_required = true;
-            memcpy(&graph->ggml_graph_properties[i], &new_props, sizeof(new_props));
+    // Loop over nodes in GGML graph to determine if CUDA graph update is required.
+    // NOTE: we do NOT save properties here — saving is deferred to
+    // save_ggml_graph_properties(), called only when the step is compatible with
+    // CUDA graphs.  Saving unconditionally (even for incompatible steps such as
+    // multi-token MTP verify batches) would overwrite the cached 1-token state with
+    // the 2-token state, causing the next 1-token step to always appear "different"
+    // and triggering too_many_updates after just 4 alternations.
+    for (int i = 0; i < (int)graph->ggml_graph_properties.size() && i < cgraph->n_nodes; i++) {
+        if (!cuda_graph_update_required) {
+            ggml_graph_node_properties new_props;
+            set_ggml_graph_node_properties(cgraph->nodes[i], &new_props);
+            if (memcmp(&graph->ggml_graph_properties[i], &new_props, sizeof(new_props)) != 0) {
+                cuda_graph_update_required = true;
+            }
         }
     }
 
     graph->uid = cgraph->uid;
 
     return cuda_graph_update_required;
+}
+
+// Save the current cgraph node properties into the graph cache.  Must be called
+// only after confirming the step is compatible with CUDA graphs (so that
+// incompatible steps, e.g. multi-token MTP verify batches, do not clobber the
+// cached 1-token state).
+static void save_ggml_graph_properties(ggml_cuda_graph * graph, ggml_cgraph * cgraph) {
+    if (graph->ggml_graph_properties.size() != (size_t)cgraph->n_nodes) {
+        graph->ggml_graph_properties.resize(cgraph->n_nodes);
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        set_ggml_graph_node_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
+    }
 }
 
 static void update_cuda_graph_executable(ggml_cuda_graph * graph) {
@@ -4694,6 +4780,49 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     }
 }
 
+// --- temporary diagnostics: report CUDA graph capture/reuse/fallback status.
+// Enabled by GGML_CUDA_GRAPH_DIAG=1; prints a summary to stderr every
+// GGML_CUDA_GRAPH_DIAG_INTERVAL graph_compute() calls, then resets counters.
+// Zero overhead when the env var is unset (checked once, cached).
+struct ggml_cuda_graph_diag_counters {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> launches{0};       // cudaGraphLaunch reused an existing captured graph
+    std::atomic<uint64_t> captures{0};       // (re-)captured this call (cuda_graph_update_required)
+    std::atomic<uint64_t> direct_exec{0};    // graphs disabled/unavailable, ran nodes directly
+    std::atomic<uint64_t> disabled_gpu_arch{0};
+    std::atomic<uint64_t> disabled_too_many_updates{0};
+    std::atomic<uint64_t> disabled_failed_capture{0};
+    std::atomic<uint64_t> disabled_incompatible_node{0};
+};
+static ggml_cuda_graph_diag_counters g_cuda_graph_diag;
+
+static void ggml_cuda_graph_diag_maybe_report() {
+    static const bool enabled = (getenv("GGML_CUDA_GRAPH_DIAG") != nullptr);
+    if (!enabled) {
+        return;
+    }
+    static const uint64_t interval = [] {
+        const char * s = getenv("GGML_CUDA_GRAPH_DIAG_INTERVAL");
+        return s ? (uint64_t) strtoull(s, nullptr, 10) : (uint64_t) 500;
+    }();
+    uint64_t calls = ++g_cuda_graph_diag.calls;
+    if (calls % interval == 0) {
+        fprintf(stderr,
+            "[cuda-graph-diag] calls=%llu launches(reused)=%llu captures(re-captured)=%llu "
+            "direct_exec(no-graph)=%llu disabled[gpu_arch=%llu too_many_updates=%llu "
+            "failed_capture=%llu incompatible_node=%llu]\n",
+            (unsigned long long) calls,
+            (unsigned long long) g_cuda_graph_diag.launches.load(),
+            (unsigned long long) g_cuda_graph_diag.captures.load(),
+            (unsigned long long) g_cuda_graph_diag.direct_exec.load(),
+            (unsigned long long) g_cuda_graph_diag.disabled_gpu_arch.load(),
+            (unsigned long long) g_cuda_graph_diag.disabled_too_many_updates.load(),
+            (unsigned long long) g_cuda_graph_diag.disabled_failed_capture.load(),
+            (unsigned long long) g_cuda_graph_diag.disabled_incompatible_node.load());
+    }
+}
+// --- end temporary diagnostics ---------------------------------------------
+
 GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
@@ -4721,6 +4850,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     if (use_cuda_graph && graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < CC_AMPERE) {
             graph->disable_due_to_gpu_arch = true;
+            g_cuda_graph_diag.disabled_gpu_arch++;
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
 #endif
@@ -4754,7 +4884,19 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     if (use_cuda_graph) {
         cuda_graph_update_required = is_cuda_graph_update_required(graph, cgraph);
 
+        const bool use_cuda_graph_before_compat_check = use_cuda_graph;
         use_cuda_graph = check_node_graph_compatibility_and_refresh_copy_ops(graph, cgraph, use_cuda_graph, cuda_ctx->stream());
+        if (use_cuda_graph_before_compat_check && !use_cuda_graph) {
+            g_cuda_graph_diag.disabled_incompatible_node++;
+        }
+
+        // Only save graph properties for compatible steps.  Saving for incompatible
+        // steps (e.g. multi-token MTP verify batches) would overwrite the cached
+        // 1-token state and cause every subsequent 1-token step to look "changed",
+        // driving number_consecutive_updates to 4 after just 4 alternations.
+        if (use_cuda_graph) {
+            save_ggml_graph_properties(graph, cgraph);
+        }
 
         // Disable CUDA graphs (from the next token) if the use-case is demanding too many consecutive graph updates.
         if (use_cuda_graph) {
@@ -4770,6 +4912,19 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
             graph->retry_cooldown = GGML_CUDA_GRAPH_RETRY_INTERVAL;
             use_cuda_graph = false;
             cuda_ctx->cur_graph = nullptr;
+            // Flush the stale captured graph so the retry starts fresh.
+            // Without this, the old graph's pool-allocated src1_quantized
+            // addresses remain baked into the instance and can alias other
+            // pool allocations on later steps, corrupting kernel inputs.
+            if (graph->instance) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                graph->instance = nullptr;
+            }
+            if (graph->graph) {
+                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                graph->graph = nullptr;
+            }
+            g_cuda_graph_diag.disabled_too_many_updates++;
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to too many consecutive updates\n", __func__);
 #endif
@@ -4795,6 +4950,17 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     bool use_cuda_graph = false;
     bool cuda_graph_update_required = false;
 #endif // USE_CUDA_GRAPH
+
+    if (use_cuda_graph) {
+        if (cuda_graph_update_required) {
+            g_cuda_graph_diag.captures++;
+        } else {
+            g_cuda_graph_diag.launches++;
+        }
+    } else {
+        g_cuda_graph_diag.direct_exec++;
+    }
+    ggml_cuda_graph_diag_maybe_report();
 
     bool graph_evaluated_or_captured = false;
 
