@@ -62,7 +62,7 @@ class IMatrixDatWriter:
                 np.array([len(name_bytes)], dtype=np.int32).tofile(f)
                 f.write(name_bytes)
 
-                ncall = int(entry.counts[0] / self.chunk_size)
+                ncall = int(entry.counts.flat[0] / self.chunk_size)
                 np.array([ncall], dtype=np.int32).tofile(f)
                 np.array([len(entry.values)], dtype=np.int32).tofile(f)
 
