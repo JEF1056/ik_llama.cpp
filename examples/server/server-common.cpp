@@ -650,8 +650,14 @@ json oaicompat_chat_params_parse(
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 
-    // Tools and structured tool choice are natively handled by Jinja
-    (void)tool_choice;
+    if (!opt.use_jinja) {
+        if (has_tools) {
+            throw std::runtime_error("tools param requires --jinja flag");
+        }
+        if (tool_choice != "auto") {
+            throw std::runtime_error("tool_choice param requires --jinja flag");
+        }
+    }
     // Handle "stop" field
     if (body.contains("stop") && body.at("stop").is_string()) {
         llama_params["stop"] = json::array({ body.at("stop").get<std::string>() });
