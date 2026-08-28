@@ -249,10 +249,6 @@ bool server_context::load_model(const gpt_params& params_) {
         //    SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
         //}
 
-        if (has_draft_model) {
-            LOG_ERROR("%s\n", "err: speculative decode is not supported by multimodal");
-            return false;
-        }
 
         // Multimodal support originally only covered a single MTP stage
         // (see #1758: MTP's warmup was taught to consume mtmd embedding
