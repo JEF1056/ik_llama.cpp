@@ -1359,7 +1359,7 @@ int main(int argc, char ** argv) {
                 {"mode", "tokens"},
                 {"limit", params.n_ctx},
             }},
-            {"supports_parallel_tool_calls", false},
+            {"supports_parallel_tool_calls", true},
             {"supports_image_detail_original", false},
             {"context_window", params.n_ctx},
             {"max_context_window", params.n_ctx},

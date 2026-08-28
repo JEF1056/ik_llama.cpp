@@ -174,7 +174,7 @@ struct common_chat_templates_inputs {
     // Parameters below only supported when use_jinja is true
     std::vector<common_chat_tool>         tools;
     common_chat_tool_choice               tool_choice         = COMMON_CHAT_TOOL_CHOICE_AUTO;
-    bool                                  parallel_tool_calls = false;
+    bool                                  parallel_tool_calls = true;
     common_reasoning_format               reasoning_format    = COMMON_REASONING_FORMAT_NONE; // TODO: refactor this to "bool enable_thinking"
     bool                                  enable_thinking     = true;
     std::chrono::system_clock::time_point now                 = std::chrono::system_clock::now();
