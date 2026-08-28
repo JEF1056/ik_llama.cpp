@@ -437,14 +437,31 @@ void server_context::init() {
         try {
             chat_templates = common_chat_templates_init(model, params_base.chat_template);
 
-            LOG_INF("%s: chat template, example_format: '%s'\n", __func__,
-                common_chat_format_example(chat_templates.get(), params_base.use_jinja, params_base.default_template_kwargs).c_str());
-
+            try {
+                LOG_INF("%s: chat template, example_format: '%s'\n", __func__,
+                    common_chat_format_example(chat_templates.get(), params_base.use_jinja, params_base.default_template_kwargs).c_str());
+            } catch (const std::exception & ex) {
+                LOG_WRN("%s: could not format example chat template: %s\n", __func__, ex.what());
+            }
         }
         catch (const std::exception & e) {
             SRV_ERR("%s: chat template parsing error: %s\n", __func__, e.what());
             SRV_ERR("%s: please consider enabling jinja via --jinja, or use a custom chat template via --chat-template\n", __func__);
             SRV_ERR("%s: for example:  --chat-template chatml\n", __func__);
+            if (!chat_templates) {
+                try {
+                    chat_templates = common_chat_templates_init(model, "chatml");
+                } catch (...) {
+                    chat_templates = common_chat_templates_init(nullptr, "chatml");
+                }
+            }
+        }
+        if (!chat_templates) {
+            try {
+                chat_templates = common_chat_templates_init(model, "chatml");
+            } catch (...) {
+                chat_templates = common_chat_templates_init(nullptr, "chatml");
+            }
         }
 
         // thinking is enabled if:
