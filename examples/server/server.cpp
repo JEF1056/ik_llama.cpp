@@ -1366,7 +1366,7 @@ int main(int argc, char ** argv) {
             {"auto_compact_token_limit", (params.n_ctx * 9) / 10},
             {"effective_context_window_percent", 95},
             {"experimental_supported_tools", json::array()},
-            {"input_modalities", json::array({"text"})},
+            {"input_modalities", (!params.mmproj.path.empty() && !params.no_mmproj) ? json::array({"text", "image"}) : json::array({"text"})},
             {"supports_search_tool", false},
             {"use_responses_lite", false},
             {"auto_review_model_override", nullptr},
