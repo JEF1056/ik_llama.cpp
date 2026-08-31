@@ -3685,11 +3685,12 @@ void server_context::apply_checkpoint(server_slot & slot) {
     const auto pos_min_thold = std::max(0, pos_next - 1);
     const bool is_dsv4 = llama_model_is_deepseek4(model);
     const bool is_openpangu = llama_model_is_openpangu(model);
+    const bool is_recurrent = llama_model_has_recurrent(model);
     if (slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
         int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
 
-        // DSV4 and openPangu have pos_min=0 (no eviction) so the guard always blocks them
-        if (pos_min >= pos_min_thold || is_dsv4 || is_openpangu) {
+        // DSV4, openPangu and recurrent/hybrid models have pos_min=0 (no individual cell eviction)
+        if (pos_min >= pos_min_thold || is_dsv4 || is_openpangu || is_recurrent) {
             SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min);
 
             // search for a context checkpoint
@@ -3697,7 +3698,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
                 [&](const auto & cur) {
-                    return cur.pos_max < (is_dsv4 || is_openpangu ? pos_next : pos_min_thold);
+                    return cur.pos_max < (is_dsv4 || is_openpangu || is_recurrent ? pos_next : pos_min_thold);
                 }
             );
 
@@ -3707,7 +3708,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 // restore the context checkpoint
                 const int64_t t_start = ggml_time_us();
                 const size_t checkpoint_size = it->data.size();
-                const bool rewound = !is_openpangu ||
+                const bool rewound = is_recurrent || is_dsv4 || !is_openpangu ||
                     llama_kv_cache_seq_rm(slot.ctx, slot.id, it->pos_max + 1, -1);
                 const size_t n = rewound
                     ? llama_state_seq_set_data(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
@@ -3725,7 +3726,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 }
 
                 if (!do_reset) {
-                    if (is_dsv4 || is_openpangu) {
+                    if (is_dsv4 || is_openpangu || is_recurrent) {
                         pos_next = std::min(pos_next, it->pos_max + 1);
                     } else {
                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
@@ -3746,12 +3747,12 @@ void server_context::apply_checkpoint(server_slot & slot) {
             }
 
             if (do_reset) {
-                if (is_openpangu) {
+                if (is_openpangu || is_recurrent) {
                     common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
                     slot.server_cached_prompt.checkpoints.clear();
                     slot.checkpoint_pos = -1;
                 }
-                if (is_dsv4 || is_openpangu) {
+                if (is_dsv4 || is_openpangu || is_recurrent) {
                     SLT_WRN(slot, "%s", "no checkpoint before divergence point - reprocessing from scratch\n");
                 } else {
                     SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA, see %s)\n",
@@ -4090,9 +4091,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past = 0;
                 }
                 slot.cache_tokens.keep_first(slot.n_past);
-                int p0 = (int)system_tokens.size() + slot.n_past;
-                p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                const bool trimmed = common_speculative_trim_sequence(slot.spec, ctx, slot.id, p0);
+                int p0 = (int)system_tokens.size() + slot.cache_tokens.pos_next();
+                const bool is_recurrent_or_hybrid = llama_model_has_recurrent(model);
+                const bool trimmed = is_recurrent_or_hybrid || common_speculative_trim_sequence(slot.spec, ctx, slot.id, p0);
                 if (!trimmed) {
                     // could not partially delete (likely using a non-Transformer model)
                     common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
